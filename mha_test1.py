@@ -7,7 +7,7 @@ from jaxtyping import Array, Float, Bool, PRNGKeyArray, PyTree
 import math
 import functools as ft
 import time
-
+import sys 
 # ic.disable()
 
 query_input_dim = 16
@@ -16,13 +16,14 @@ key_input_dim = 16
 key_embedding_dim = 32
 value_input_dim = 16
 value_embedding_dim = 32
-num_heads = 4
-max_seq_len = 10
-batch_size = 2
+num_heads = 32
+max_seq_len = 8
+batch_size = 64
 output_dim = 32
-kv_multihead_dim = 4
-query_multihead_dim = 4
+kv_multihead_dim = 32
+query_multihead_dim = 32
 
+dropout_rate = 0.2
 
 key = jax.random.PRNGKey(42)
 
@@ -45,6 +46,8 @@ def dot_product_attention(
     key_projection: Float[Array, "max_seq_len key_embedding_dim"],
     value_projection: Float[Array, "max_seq_len value_embedding_dim"],
     mask: Optional[Array | None | Bool] = None,
+    dropout: Optional[eqx.nn.Dropout | None] = None,
+    key: Optional[PRNGKeyArray |None] = None,
 ) -> Array:
     attention_weights = query_projection @ key_projection.T
     attention_weights = attention_weights / jnp.sqrt(key_projection.shape[-1])
@@ -56,12 +59,14 @@ def dot_product_attention(
         # ic(mask.shape)
         attention_weights = jnp.where(mask, attention_weights, float("-inf"))
     attention_weights = jax.nn.softmax(attention_weights, axis=-1)
+    if dropout is not None and key is not None:
+        attention_weights = dropout(attention_weights, key=key)
     qkv_matmul = attention_weights @ value_projection
     return qkv_matmul
 
 
-def vmapped_attention(query_heads, key_heads, value_heads, mask):
-    attn_fn = ft.partial(dot_product_attention, mask=mask)
+def vmapped_attention(query_heads, key_heads, value_heads, mask, dropout, key):
+    attn_fn = ft.partial(dot_product_attention, mask=mask, dropout=dropout, key=key)
     # Inner VMAP
     dpa = jax.vmap(
         lambda q, k, v: attn_fn(q, k, v),
@@ -92,6 +97,9 @@ class MultiheadAttention(eqx.Module):
     num_heads: int = eqx.field(static=True)
     output_dim: int = eqx.field(static=True)
 
+    dropout: eqx.nn.Dropout
+    dropout_attention: eqx.nn.Dropout
+
     def __init__(
         self,
         query_embedding_dim,
@@ -106,7 +114,7 @@ class MultiheadAttention(eqx.Module):
         kv_multihead_dim: Optional[int],
         key,
     ):
-        qkey, kkey, vkey, okey = jax.random.split(key, 4)
+        key, qkey, kkey, vkey, okey = jax.random.split(key, 5)
         self.query_projection = eqx.nn.Linear(
             query_input_dim, num_heads * query_embedding_dim, key=qkey, use_bias=False
         )
@@ -127,6 +135,9 @@ class MultiheadAttention(eqx.Module):
             num_heads * value_embedding_dim, output_dim, key=okey, use_bias=False
         )
 
+        self.dropout = eqx.nn.Dropout(dropout_rate)
+        self.dropout_attention = eqx.nn.Dropout(dropout_rate)
+
         # parameters
         self.query_input_dim = query_input_dim
         self.query_embedding_dim = query_embedding_dim
@@ -139,28 +150,34 @@ class MultiheadAttention(eqx.Module):
         self.query_multihead_dim = query_multihead_dim
         self.kv_multihead_dim = kv_multihead_dim
 
-    def __call__(self, x: Float[Array, "max_seq_len input_dim"], masking: bool = False):
+    def __call__(self, x: Float[Array, "max_seq_len input_dim"], masking: bool = False, inference: bool = False, key: Optional[PRNGKeyArray | None] = None):
         seq_len, _ = x.shape
         query = jax.vmap(self.query_projection)(x).reshape(
             seq_len, self.num_heads, self.query_embedding_dim
         )
-        key = jax.vmap(self.key_projection)(x).reshape(
+        key_ = jax.vmap(self.key_projection)(x).reshape(
             seq_len, self.kv_multihead_dim, self.key_embedding_dim
         )
         value = jax.vmap(self.value_projection)(x).reshape(
             seq_len, self.kv_multihead_dim, self.value_embedding_dim
         )
 
+        attention_key = None
+        output_key = None
+        if key is not None:
+            key, attention_key, output_key = jax.random.split(key, 3)
         pt_vmapped_fn = ft.partial(
             vmapped_attention,
             mask=masking,
+            dropout=self.dropout_attention if not inference else None,
+            key=attention_key,
         )
 
         # Outer VMAP
         qkv_matmul = jax.vmap(
             pt_vmapped_fn,
             in_axes=(None, 1, 1),
-        )(query, key, value)
+        )(query, key_, value)
 
         qkv_matmul = jnp.sum(qkv_matmul, axis=0)
 
@@ -168,6 +185,7 @@ class MultiheadAttention(eqx.Module):
         qkv_matmul = qkv_matmul / self.kv_multihead_dim
         concatenation = qkv_matmul.reshape(seq_len, -1)
         output = jax.vmap(self.output)(concatenation)
+        output = self.dropout(output, inference=inference, key=output_key)
         return output
 
 
@@ -191,7 +209,8 @@ class RMSNorm(eqx.Module):
 class Transformer(eqx.Module):
     input_embedding: eqx.nn.Embedding
     masked_mha: MultiheadAttention
-    feedforward: eqx.nn.MLP
+    feedforward: eqx.nn.MLP 
+    ff_dropout: eqx.nn.Dropout
     rms_norm: RMSNorm
 
     output: eqx.nn.Linear
@@ -226,13 +245,15 @@ class Transformer(eqx.Module):
         )
 
         # Equinox has a built-in MLP module
-        self.feedforward = eqx.nn.MLP(
-            in_size=n_embd,
-            out_size=n_embd,
-            width_size=width_size,
-            key=subkeys[2],
-            depth=depth,
-        )
+
+        self.feedforward =eqx.nn.MLP(
+                in_size=n_embd,
+                out_size=n_embd,
+                width_size=width_size,
+                key=subkeys[2],
+                depth=depth,
+            )
+        self.ff_dropout = eqx.nn.Dropout(dropout_rate)
         self.positional_encoding = get_positional_encoding(max_token_size, n_embd)
 
         self.rms_norm = RMSNorm(dim=n_embd)
@@ -241,22 +262,56 @@ class Transformer(eqx.Module):
             in_features=n_embd, out_features=n_dims, key=subkeys[4], use_bias=False
         )
 
-    def __call__(self, x):
+    def __call__(self, x, key: Optional[PRNGKeyArray | None] = None, inference: bool = False):
+        mha_key = None
+        ff_key = None
+        if key is not None:
+            key, mha_key, ff_key = jax.random.split(key, 3)
         x = jax.vmap(self.input_embedding)(x)
         x += self.positional_encoding
-        x = self.rms_norm(self.masked_mha(x, masking=True) + x)  # residual connection
-        x = self.rms_norm(jax.vmap(self.feedforward)(x) + x)  # residual connection
+        x = self.rms_norm(self.masked_mha(x, masking=True, key=mha_key, inference=inference) + x)  # residual connection
+        ff = jax.vmap(self.feedforward)(x)
+        if ff_key is not None:
+            partial_dropout = ft.partial(self.ff_dropout, key=ff_key, inference=False)
+        else:
+            partial_dropout = ft.partial(self.ff_dropout, inference=True)
+        ff = partial_dropout(ff)
+        x = self.rms_norm(ff + x)  # residual connection
         x = jax.vmap(self.output)(x)
         # x = jax.nn.softmax(x) # we don't softmax here, because we want the raw logits for our loss function
         # but you can totally softmax here and inverse that later;
         return x
 
 
+def generate_text(
+    transformer: Transformer,
+    decode,
+    max_len: int = 100,
+    max_seq_len: int = 8,
+):
+    key = jax.random.PRNGKey(222)
+    start_tokens = jnp.array([0] * max_seq_len) # we start with a sequence of zeros
+
+    for i in range(max_len):
+        key, subkey = jax.random.split(key)
+        logits = transformer(start_tokens, inference=True) # [max_seq_len, vocab_size]; this generates a distribution over the vocabulary
+        #ic(logits.shape)
+        # we can sample from this distribution to get the next token
+        next_token = jax.random.categorical(logits=logits, axis=-1, key=subkey)[-1] # we take the last token
+        # next token needs to have the same dimensions as start tokens
+        next_token = jnp.expand_dims(next_token, axis=0)
+        #ic(next_token)
+        start_tokens = jnp.concatenate([start_tokens[1:], next_token]) # we shift the tokens to the left and append the next token
+        #ic(int(next_token))
+        print(decode([int(next_token)]), end="", flush=True)
+
+    print()    
+
 def main():
     from tinyshakespeareloader.hamlet import get_data
     import optax
-
-    data = get_data()
+    MAX_T = 256
+    data = get_data(batch_size=batch_size, block_size=MAX_T)
 
     train_dataloader, test_dataloader, vocabulary_size, chars, encode, decode = (
         data["train_dataloader"],
@@ -268,12 +323,13 @@ def main():
     )
     key = jax.random.PRNGKey(420)
     INPUT_DIMS: int = int(vocabulary_size)
-    N_EMBD = 32
-    N_HEADS = 4
-    MAX_T = 8
+    N_EMBD = 128
+    N_HEADS = 16
+    
 
-    def loss_fn(transformer: Transformer, x: Array, y: Array):
-        logits = eqx.filter_vmap(transformer)(x)
+    def loss_fn(transformer: Transformer, x: Array, y: Array, key: Optional[PRNGKeyArray | None] = None, inference: bool = False):
+        partial_transformer = ft.partial(transformer, key=key, inference=inference)
+        logits = eqx.filter_vmap(partial_transformer)(x)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
 
         return jnp.mean(loss)
@@ -284,7 +340,7 @@ def main():
         for x, y in test_dataloader:
             x = jnp.array(x.numpy())
             y = jnp.array(y.numpy())
-            loss += jitted_loss_fn(transformer, x, y)
+            loss += jitted_loss_fn(transformer, x, y, inference=True)
 
         return loss / len(test_dataloader)
 
@@ -295,34 +351,37 @@ def main():
         optimiser: optax.GradientTransformation,
         x: Array,
         y: Array,
+        key: PRNGKeyArray,
     ):
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(transformer, x, y)
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(transformer, x, y, key=key)
         updates, opt_state = optimiser.update(grads, opt_state, transformer)
         transformer = eqx.apply_updates(transformer, updates)
         return transformer, opt_state, loss
 
     transformer = Transformer(
-        n_dims=INPUT_DIMS, n_embd=N_EMBD, n_heads=N_HEADS, key=key
+        n_dims=INPUT_DIMS, n_embd=N_EMBD, n_heads=N_HEADS, key=key, max_token_size=MAX_T
     )
     # start_loss = evaluate(transformer, test_dataloader)
     # print(f"{start_loss=}")
-    optimiser = optax.adamw(learning_rate=0.001)
+    optimiser = optax.adamw(learning_rate=3e-4)
     opt_state = optimiser.init(eqx.filter(transformer, eqx.is_inexact_array))
+    generate_text(transformer, decode, max_seq_len=MAX_T)
     ic("starting training")
     start_time = time.time()
     for i, (x, y) in enumerate(train_dataloader):
         x = jnp.array(x.numpy())
         y = jnp.array(y.numpy())
-        transformer, opt_state, loss = step(transformer, opt_state, optimiser, x, y)
+        key, subkey = jax.random.split(key)
+        transformer, opt_state, loss = step(transformer, opt_state, optimiser, x, y, key=subkey)
         if i % 100 == 0:
             eval_loss = evaluate(transformer, test_dataloader)
             ic(i, loss, eval_loss)
-        if i == 1000:
-            ic("early stopping")
-            break
+        if i % 1000 == 0:
+            generate_text(transformer, decode, max_seq_len=MAX_T)
     end_time = time.time()
     ic("done training")
     ic("training time:", end_time - start_time)
+    generate_text(transformer, decode)
     ic(evaluate(transformer, test_dataloader))
 
 
